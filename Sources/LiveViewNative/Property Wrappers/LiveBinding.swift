@@ -116,15 +116,18 @@ public struct LiveBinding<Value: Codable> {
         return bindingName != nil
     }
     
+    private let sendChangeEvent: Bool
+    
     /// Creates a `LiveBinding` property wrapper that uses the binding in the given attribute.
     ///
     /// This initializer should be used when the live binding is used as part of an element.
     /// See ``LiveBinding`` for a discussion of how the underlying binding name is determined and an example of this usage.
     ///
     /// If a binding name is not provided in the given attribute and you provide a wrapped value, the `LiveBinding` operates in local mode, using the wrapped value as the initial value for the property.
-    public init(wrappedValue: Value? = nil, attribute: AttributeName) {
+    public init(wrappedValue: Value? = nil, attribute: AttributeName, sendChangeEvent: Bool = true) {
         self.bindingNameSource = .attribute(attribute)
         self.initialLocalValue = wrappedValue
+        self.sendChangeEvent = sendChangeEvent
     }
     
     /// Creates a `LiveBinding` by decoding its name from a container.
@@ -135,13 +138,14 @@ public struct LiveBinding<Value: Codable> {
     /// The name key is treated as optional when decoding.
     /// If a binding name is not provided, the `LiveBinding` operates in local mode.
     /// In that mode, the `initialValue` is used as the initial value of the property.
-    public init<K: CodingKey>(decoding key: K, in container: KeyedDecodingContainer<K>, initialValue: Value? = nil) throws {
+    public init<K: CodingKey>(decoding key: K, in container: KeyedDecodingContainer<K>, initialValue: Value? = nil, sendChangeEvent: Bool = true) throws {
         if let name = try container.decodeIfPresent(String.self, forKey: key) {
             self.bindingNameSource = .fixed(name)
         } else {
             self.bindingNameSource = .none
         }
         self.initialLocalValue = initialValue
+        self.sendChangeEvent = sendChangeEvent
     }
     
     /// The value of the binding.
@@ -158,6 +162,7 @@ public struct LiveBinding<Value: Codable> {
             }
         }
         nonmutating set {
+            data.objectWillChange.send()
             data.value = newValue
             data.localValueChanged.send() // make sure to send a signal when the client changes the value.
         }
@@ -179,16 +184,32 @@ extension LiveBinding: DynamicProperty {
     public func update() {
         switch bindingNameSource {
         case let .attribute(attribute):
-            data.bind(
-                to: liveViewModel,
-                bindingName: bindingName,
-                debounce: (try? element.attributeValue(Double.self, for: .init(namespace: attribute.name, name: "debounce"))) ?? 0
-            )
+            let target = try? element.attributeValue(Int.self, for: "phx-target")
+            let debounce = (try? element.attributeValue(Double.self, for: .init(namespace: attribute.name, name: "debounce"))) ?? 0
+            if let phxChange = element.attributeValue(for: "phx-change") {
+                data.bind(
+                    to: liveViewModel,
+                    source: .manual(element.attribute(named: attribute), changeEvent: phxChange, sendChangeEvent: sendChangeEvent),
+                    target: target,
+                    debounce: debounce,
+                    coordinator: coordinator
+                )
+            } else {
+                data.bind(
+                    to: liveViewModel,
+                    source: .nativeBinding(bindingName),
+                    target: target,
+                    debounce: debounce,
+                    coordinator: coordinator
+                )
+            }
         default:
             data.bind(
                 to: liveViewModel,
-                bindingName: bindingName,
-                debounce: 0
+                source: .nativeBinding(bindingName),
+                target: nil,
+                debounce: 0,
+                coordinator: coordinator
             )
         }
     }
@@ -207,42 +228,90 @@ extension LiveBinding {
         /// The current value of the binding.
         var value: Value?
         
+        let objectWillChange = ObjectWillChangePublisher()
+        
         /// A publisher used to track when the value is changed by the client.
         let localValueChanged: ObjectWillChangePublisher = .init()
         
         var valueCancellable: AnyCancellable?
         var cancellable: AnyCancellable?
         
-        func bind(to model: LiveViewModel, bindingName: String?, debounce: Double) {
-            if let bindingName {
-                if valueCancellable == nil && cancellable == nil,
-                   let defaultValue = model.bindingValues[bindingName]
-                {
-                    let decoder = FragmentDecoder(data: defaultValue)
-                    value = try! Value(from: decoder)
-                }
+        enum Source {
+            case nativeBinding(String?)
+            case manual(LiveViewNativeCore.Attribute?, changeEvent: String, sendChangeEvent: Bool)
+        }
+        
+        func bind(
+            to model: LiveViewModel,
+            source: Source,
+            target: Int?,
+            debounce: Double,
+            coordinator: CoordinatorEnvironment?
+        ) {
+            switch source {
+            case .nativeBinding(let bindingName):
                 // Watch for local changes to the value.
-                valueCancellable = self.localValueChanged
-                    .debounce(for: .init(debounce), scheduler: RunLoop.current)
-                    .sink { [weak self, weak model] _ in
-                        guard let value = self?.value else { return }
-                        let encoder = FragmentEncoder()
-                        try! value.encode(to: encoder)
-                        guard let encodedValue = encoder.unwrap()
-                        else { return }
-                        model?.setBinding(bindingName, to: encodedValue)
+                let localValueChanged: AnyPublisher<(), Never>
+                if debounce > 0 {
+                    localValueChanged = self.localValueChanged
+                        .debounce(for: .init(debounce), scheduler: RunLoop.current)
+                        .eraseToAnyPublisher()
+                } else {
+                    localValueChanged = self.localValueChanged.eraseToAnyPublisher()
+                }
+                if let bindingName {
+                    // automatic `native_binding` handling
+                    if valueCancellable == nil && cancellable == nil,
+                       let defaultValue = model.bindingValues[bindingName]
+                    {
+                        let decoder = FragmentDecoder(data: defaultValue)
+                        value = try! Value(from: decoder)
                     }
-                // Watch for changes from the server.
-                cancellable = model.bindingUpdatedByServer
-                    .filter({ $0.0 == bindingName })
-                    .sink(receiveValue: { [weak self] newValue in
-                        let decoder = FragmentDecoder(data: newValue.1)
-                        self?.value = try! Value(from: decoder)
-                        self?.objectWillChange.send()
-                    })
-            } else {
-                valueCancellable = nil
-                cancellable = nil
+                    valueCancellable = localValueChanged
+                        .sink { [weak self, weak model] _ in
+                            guard let value = self?.value else { return }
+                            let encoder = FragmentEncoder()
+                            try! value.encode(to: encoder)
+                            guard let encodedValue = encoder.unwrap()
+                            else { return }
+                            model?.setBinding(bindingName, to: encodedValue)
+                        }
+                    // Watch for changes from the server.
+                    cancellable = model.bindingUpdatedByServer
+                        .filter({ $0.0 == bindingName })
+                        .sink(receiveValue: { [weak self] newValue in
+                            let decoder = FragmentDecoder(data: newValue.1)
+                            self?.value = try! Value(from: decoder)
+                            self?.objectWillChange.send()
+                        })
+                } else {
+                    valueCancellable = nil
+                    cancellable = nil
+                }
+            case .manual(let attribute, let changeEvent, let sendChangeEvent):
+                if let attribute {
+                    if valueCancellable == nil {
+                        if let attributeDecodable = Value.self as? AttributeDecodable.Type {
+                            value = try! attributeDecodable.init(from: attribute) as! Value
+                        } else if let defaultValue = attribute.value.flatMap({ Foundation.Data($0.utf8) }) {
+                            value = try! JSONDecoder().decode(Value.self, from: defaultValue)
+                        }
+                    }
+                    valueCancellable = localValueChanged
+                        .sink { [weak self] in
+                            guard sendChangeEvent,
+                                  let value = self?.value,
+                                  let encoded = try? JSONEncoder().encode(value),
+                                  let object = try? JSONSerialization.jsonObject(with: encoded, options: [.fragmentsAllowed])
+                            else { return }
+                            Task {
+                                try await coordinator?.pushEvent("click", changeEvent, [attribute.name.rawValue: object], target)
+                            }
+                        }
+                } else {
+                    valueCancellable = nil
+                    cancellable = nil
+                }
             }
         }
     }
